@@ -1,8 +1,15 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+import os
 
-# ---------------- CONFIG ---------------- #
+try:
+    import openai
+except ImportError:
+    openai = None
+
+import smtplib
+from email.mime.text import MIMEText
 
 DEFAULT_STATES = ["CA", "TX", "FL", "AZ", "NV", "CO", "GA"]
 PRODUCT_TYPES = ["Any", "Refi", "Purchase", "DSCR Investor", "Bridge / Fix & Flip"]
@@ -133,6 +140,93 @@ def score_lead(row, config):
     return score
 
 
+def build_ai_prompt(lead: dict) -> str:
+    return f"""
+You are an expert private lender and DSCR / bridge loan underwriter for Fetti Financial Services.
+
+Analyze this mortgage lead and produce a concise but detailed summary.
+
+Lead data:
+- Name: {lead.get('first_name','')} {lead.get('last_name','')}
+- Email: {lead.get('email','')}
+- Phone: {lead.get('phone','')}
+- State: {lead.get('state','')}
+- Occupancy: {lead.get('occupancy','')}
+- Property value: {lead.get('property_value','')}
+- Loan purpose: {lead.get('loan_purpose','')}
+- Credit band or score: {lead.get('credit_band') or lead.get('credit_score')}
+- Liquid assets: {lead.get('liquid_assets','')}
+- Notes: {lead.get('notes','')}
+
+Return your answer in this structure (plain text, no JSON):
+
+1) Product fit: (e.g. DSCR refi, bridge, fix & flip, full doc, bank statement, etc.)
+2) Estimated max LTV / CLTV you would be comfortable with and why.
+3) If investor/rental: estimated DSCR and whether it seems to qualify.
+4) Recommended loan amount range.
+5) Strength score from 0–100 and one-line justification.
+6) Key risks / red flags.
+7) Exact “Next steps” Ramon should take with this borrower.
+8) One-line subject line Ramon could use for follow-up email.
+    """.strip()
+
+
+def analyze_lead_with_ai(lead: dict) -> str:
+    api_key = None
+    try:
+        api_key = st.secrets.get("OPENAI_API_KEY")  # type: ignore[attr-defined]
+    except Exception:
+        api_key = None
+
+    if not api_key or openai is None:
+        return "AI summary unavailable (missing OPENAI_API_KEY or openai library)."
+
+    try:
+        openai.api_key = api_key
+        prompt = build_ai_prompt(lead)
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are an expert mortgage and private lending underwriter."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=600,
+            temperature=0.2,
+        )
+        text = resp["choices"][0]["message"]["content"]
+        return text.strip()
+    except Exception as e:
+        return f"AI summary error: {e}"
+
+
+def send_email_notification(subject: str, body: str, to_email: str) -> None:
+    try:
+        secrets = st.secrets  # type: ignore[attr-defined]
+        host = secrets.get("SMTP_HOST", "")
+        port = int(secrets.get("SMTP_PORT", 587))
+        user = secrets.get("SMTP_USER", "")
+        password = secrets.get("SMTP_PASSWORD", "")
+        from_email = secrets.get("FROM_EMAIL", to_email)
+    except Exception:
+        return
+
+    if not host or not user or not password:
+        return
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = from_email
+    msg["To"] = to_email
+
+    try:
+        with smtplib.SMTP(host, port) as server:
+            server.starttls()
+            server.login(user, password)
+            server.send_message(msg)
+    except Exception as e:
+        st.warning(f"Email notification failed: {e}")
+
+
 def view_scoring_tab():
     st.subheader("📊 Upload & Score Leads (CSV)")
 
@@ -217,7 +311,7 @@ def view_capture_tab():
 
     st.write(
         "Use this form as a live lead capture page. Send this page link to clients or "
-        "run ads directly to it. Every submission is saved into captured_leads.csv."
+        "run ads directly to it. Every submission is saved into captured_leads.csv and can trigger AI + email."
     )
 
     with st.form("lead_capture_form"):
@@ -281,7 +375,39 @@ def view_capture_tab():
                 df_out = pd.DataFrame([row])
 
             df_out.to_csv(leads_path, index=False)
+
+            ai_summary = analyze_lead_with_ai(row)
+
             st.success("✅ Lead captured and saved to captured_leads.csv")
+            st.subheader("🧠 AI Loan Summary")
+            st.text(ai_summary)
+
+            try:
+                notify_email = st.secrets.get("NOTIFY_EMAIL", "info@fettifi.com")  # type: ignore[attr-defined]
+            except Exception:
+                notify_email = "info@fettifi.com"
+
+            subject = f"🔥 New Fetti Lead: {first_name} {last_name} – {loan_purpose}"
+            body = f"""
+New lead captured via Fetti Leads app.
+
+Name: {first_name} {last_name}
+Email: {email}
+Phone: {phone}
+State: {state}
+Occupancy: {occupancy}
+Property value: {property_value}
+Loan purpose: {loan_purpose}
+Credit profile: {credit_band}
+Liquid assets: {liquid_assets}
+Notes: {notes}
+
+--- AI Loan Summary ---
+{ai_summary}
+
+This lead is also stored in captured_leads.csv in your app workspace.
+"""
+            send_email_notification(subject, body, notify_email)
 
     st.markdown("---")
     st.write("Latest captured leads preview (from captured_leads.csv):")
@@ -293,12 +419,14 @@ def view_capture_tab():
 
 
 def main():
-    st.set_page_config(page_title="Fetti Leads – Capture & Score", layout="wide")
+    st.set_page_config(page_title="Fetti Leads – Capture, Score & AI Qualify", layout="wide")
 
-    st.title("🧠 Fetti Leads – Real Lead Capture & Scoring")
+    st.markdown(
+        "<h1 style='color:#0b8f3c;'>🧠 Fetti Leads – Real Lead Capture, Scoring & AI Qualification</h1>",
+        unsafe_allow_html=True,
+    )
     st.write(
-        "Use this app in two ways: (1) capture real leads directly via the form, "
-        "and (2) upload external lead lists to score and prioritize them."
+        "Capture real mortgage and investor leads, score uploaded lists, and let Fetti AI pre-underwrite every deal."
     )
 
     tab1, tab2 = st.tabs(["📥 Capture New Leads", "📊 Upload & Score Leads"])
